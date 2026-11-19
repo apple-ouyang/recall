@@ -24,7 +24,9 @@ done
 # Sources recall has no Go adapter for. claude / codex / cursor / cursor-agent /
 # pi / memory / skill are upstream plugins; the built-in adapters already cover
 # the first five.
-names="grok kimi droid omp codex-archived agy cursor-acp devin dsh mimo opencode"
+# codex-archived is a built-in Go adapter (the archive tree uses the same
+# rollout parser as codex), not a plugin, so it is not listed here.
+names="grok kimi droid omp agy cursor-acp devin dsh mimo opencode"
 
 if ! command -v recall >/dev/null 2>&1; then
   echo "error: recall is not on PATH (install: https://github.com/apple-ouyang/recall)" >&2

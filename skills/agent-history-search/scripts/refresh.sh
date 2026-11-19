@@ -52,10 +52,13 @@ run_step() {
   fi
 }
 
-quiet_flag=()
-(( quiet )) && quiet_flag=(--quiet)
-
-run_step "plugin install" bash "${skill_root}/scripts/install_plugins.sh" "${quiet_flag[@]:-}"
+# Note: an empty array must not be expanded as "${arr[@]:-}" — that passes one
+# empty argument, and install_plugins.sh rejects it as an unknown flag.
+if (( quiet )); then
+  run_step "plugin install" bash "${skill_root}/scripts/install_plugins.sh" --quiet
+else
+  run_step "plugin install" bash "${skill_root}/scripts/install_plugins.sh"
+fi
 run_step "session export" bash "${skill_root}/scripts/sync_all_sessions.sh"
 
 if [[ "${mode}" == "full" ]]; then
