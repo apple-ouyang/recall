@@ -16,19 +16,27 @@ Cursor ACP.
 
 ## Before searching
 
-Install the plugins this skill needs (once per machine), refresh the
-export-backed sources, then search:
+One command prepares everything: plugins, the export-backed sources, and the
+index. Then search.
 
 ```bash
 SKILL_DIR="${SKILL_DIR:-$HOME/.agents/skills/agent-history-search}"
-bash "$SKILL_DIR/scripts/install_plugins.sh"
-bash "$SKILL_DIR/scripts/sync_all_sessions.sh"
-recall index
+bash "$SKILL_DIR/scripts/refresh.sh"
 recall "keyword" --json --limit 20
 ```
 
-`recall index` is incremental: unchanged source files cost almost nothing.
-Never build an index by hand, and never `--rebuild` the sources from scratch.
+| Command | Cost | Use when |
+|---|---|---|
+| `refresh.sh` | ~5s warm | first search in a session |
+| `refresh.sh --quick` | ~0s | the next search in the same session |
+| `refresh.sh --full` | slow (minutes) | after upgrading recall, or when old sessions seem to be missing |
+
+Every step inside it is incremental: the exporters keep a per-source manifest
+and only decode sessions that grew, and `recall index` only rereads what
+changed. Skipping prep with `--quick` is safe but can miss sessions from a
+window that is still running elsewhere.
+
+Never build an index by hand, and never rebuild the source logs.
 
 Filters:
 

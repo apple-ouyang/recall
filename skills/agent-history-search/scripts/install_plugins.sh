@@ -11,6 +11,16 @@ set -euo pipefail
 skill_root="$(cd "$(dirname "$0")/.." && pwd)"
 repo_plugins="${RECALL_PLUGINS_DIR:-${skill_root}/../../plugins}"
 
+# --quiet keeps the summary line and drops the per-plugin table.
+quiet=0
+for arg in "$@"; do
+  case "${arg}" in
+    --quiet | -q) quiet=1 ;;
+    -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ; exit 0 ;;
+    *) echo "error: unknown flag: ${arg}" >&2; exit 2 ;;
+  esac
+done
+
 # Sources recall has no Go adapter for. claude / codex / cursor / cursor-agent /
 # pi / memory / skill are upstream plugins; the built-in adapters already cover
 # the first five.
@@ -42,5 +52,5 @@ for name in ${names}; do
 done
 
 echo "plugins: ${installed} installed from the binary, ${linked} linked from ${repo_plugins}, ${failed} missing"
-recall plugin list
+(( quiet )) || recall plugin list
 (( failed == 0 )) || exit 1
