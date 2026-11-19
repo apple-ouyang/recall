@@ -1,0 +1,20 @@
+{
+  "skill_name": "agent-history-search",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Search my chat history: did I ever discuss moving the backup job off local disks to object storage, and with which agent?",
+      "expected_output": "Uses recall (plugin install + sync_all_sessions first if needed), searches globally rather than assuming the current harness, and answers with source, session_id, and a short snippet."
+    },
+    {
+      "id": 2,
+      "prompt": "Which window produced commit abcdef1, and what is the session id?",
+      "expected_output": "Searches the hash or subject with recall, trusts hits that look like real git commit output, and does not attribute the commit from a chat that merely mentions the hash."
+    },
+    {
+      "id": 3,
+      "prompt": "I renamed a Codex window by hand a while back — find it and give me only the session id.",
+      "expected_output": "Searches Codex sessions with --tag source:codex, then answers with the four-line window block and a resumable session id; missing fields are reported as unknown instead of guessed."
+    }
+  ]
+}

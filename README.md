@@ -51,6 +51,26 @@ go install github.com/pratikgajjar/recall@latest
 # …or grab a binary from https://github.com/pratikgajjar/recall/releases
 ```
 
+### This fork: extra sources and an agent skill
+
+This fork adds eleven sources upstream has no adapter for, plus the skill that
+drives the export-backed ones:
+
+```bash
+git clone https://github.com/apple-ouyang/recall && cd recall
+go build -o ~/.local/bin/recall .
+cp -R skills/agent-history-search ~/.agents/skills/
+bash ~/.agents/skills/agent-history-search/scripts/install_plugins.sh
+bash ~/.agents/skills/agent-history-search/scripts/sync_all_sessions.sh
+recall index
+```
+
+The extra plugins: `grok`, `kimi`, `droid`, `omp`, `codex-archived`, `agy`,
+`cursor-acp`, `devin`, `dsh`, `mimo`, `opencode`. Six of them need an export
+step, which `sync_all_sessions.sh` runs (Node ≥ 22, no other dependencies);
+the rest read the tool's own JSONL. `install_plugins.sh` falls back to linking
+`plugins/*.lua` from the checkout when the binary predates a plugin.
+
 Then build the index once:
 
 ```bash
@@ -273,6 +293,17 @@ tools recall has no Go adapter for:
 | `memory` | pi persistent memory | `~/.pi/agent/memory/*.md` |
 | `skill` | mirrored skill catalog | `~/.cache/pi-skill-search/catalog` |
 | `obsidian` | an Obsidian vault or notes folder | `~/Documents/Obsidian`, `~/obsidian`, `~/notes` |
+| `agy` | Antigravity CLI + IDE (exported first) | `~/.recall/agy/<id>.jsonl` ← Antigravity sqlite and `.pb` |
+| `cursor-acp` | Cursor ACP sessions (exported first) | `~/.recall/cursor-acp/<id>.jsonl` ← `~/.cursor/acp-sessions/<id>/store.db` |
+| `devin` | Devin (exported first) | `~/.recall/devin/<id>.jsonl` |
+| `dsh` | DeepSeek Harness (exported first) | `~/.recall/dsh/<id>.jsonl` ← multi-frame zstd under `~/.dsh/sessions` |
+| `mimo` | mimocode (exported first) | `~/.recall/mimo/<id>.jsonl` ← `~/.local/share/mimocode/mimocode.db` |
+| `opencode` | OpenCode (exported first) | `~/.recall/opencode/<id>.jsonl` |
+
+`agy`, `cursor-acp`, `devin`, `dsh`, `mimo`, and `opencode` store sessions in a
+shape the Lua sandbox cannot read (SQLite, protobuf, multi-frame zstd, packed
+blobs). Their agent skill exports those logs to plaintext JSONL first; the
+plugin only maps events. Everything else is read straight from the source.
 
 See [`plugins/`](plugins/) for examples and
 [`architecture.md`](architecture.md) for the full contract.
