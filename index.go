@@ -1631,8 +1631,47 @@ func (ix *Index) ForgetSession(id string) error {
 		return err
 	}
 	defer tx.Rollback()
+
+	// messages_fts.session_pk is UNINDEXED, so "WHERE session_pk = ?" scans the
+	// whole FTS table. PruneMissing calls this once per vanished session, which
+	// makes a naive delete quadratic: 944 stale agy rows held the prune at
+	// "claude indexing…" for 15+ minutes. Delete by rowid instead, using the
+	// contiguous ranges IngestBatch recorded. Sessions indexed before v5 have no
+	// range; those keep the slow path and heal on their next reindex.
+	rows, err := tx.Query(`SELECT lo, hi FROM msg_ranges WHERE session_pk = ?`, id)
+	if err != nil {
+		return err
+	}
+	var spans [][2]int64
+	for rows.Next() {
+		var lo, hi int64
+		if err := rows.Scan(&lo, &hi); err != nil {
+			rows.Close()
+			return err
+		}
+		spans = append(spans, [2]int64{lo, hi})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if len(spans) == 0 {
+		if _, err := tx.Exec(`DELETE FROM messages_fts WHERE session_pk = ?`, id); err != nil {
+			return err
+		}
+	} else {
+		for _, sp := range spans {
+			if _, err := tx.Exec(`DELETE FROM messages_fts WHERE rowid BETWEEN ? AND ?`, sp[0], sp[1]); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(`DELETE FROM msg_ranges WHERE session_pk = ?`, id); err != nil {
+			return err
+		}
+	}
+
 	for _, q := range []string{
-		`DELETE FROM messages_fts WHERE session_pk = ?`,
 		`DELETE FROM sessions_fts WHERE session_pk = ?`,
 		`DELETE FROM sessions WHERE id = ?`,
 	} {

@@ -125,28 +125,3 @@ func TestLuaOmp(t *testing.T) {
 		t.Fatalf("roles = %s", got)
 	}
 }
-
-func TestLuaCodexArchived(t *testing.T) {
-	root := t.TempDir()
-	writeLines(t, filepath.Join(root, "rollout-2026-05-01T10-00-00-sess-codex-1.jsonl"),
-		`{"type":"session_meta","payload":{"id":"sess-codex-1","cwd":"/work/acme","timestamp":"2026-05-01T10:00:00Z"}}`,
-		`{"type":"response_item","timestamp":"2026-05-01T10:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"why did it break"}]}}`,
-		`{"type":"response_item","timestamp":"2026-05-01T10:00:02Z","payload":{"type":"function_call","name":"shell","arguments":"{\"command\":\"go build ./...\"}"}}`,
-		`{"type":"response_item","timestamp":"2026-05-01T10:00:03Z","payload":{"type":"function_call_output","output":"compile error"}}`,
-		`{"type":"response_item","timestamp":"2026-05-01T10:00:04Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"missing import"}]}}`,
-	)
-	sessions, msgs := scanPlugin(t, "codex-archived.lua", root)
-	s := sessions[0]
-	if s.SourceID != "sess-codex-1" || s.Project != "/work/acme" || s.StartedAt == 0 {
-		t.Fatalf("session = %+v", s)
-	}
-	if got := strings.Join(roles(msgs), ","); got != "user,tool:shell,tool,assistant" {
-		t.Fatalf("roles = %s", got)
-	}
-	if msgs[1].Text != "go build ./..." {
-		t.Errorf("function_call text = %q (arg_summary should pick command)", msgs[1].Text)
-	}
-	if msgs[2].Text != "compile error" {
-		t.Errorf("function_call_output text = %q", msgs[2].Text)
-	}
-}

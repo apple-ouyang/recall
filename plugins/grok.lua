@@ -61,6 +61,12 @@ return {
 
   line = function(line, st)
     st.id = session_id(st)
+    -- Grok writes no timestamps anywhere in chat_history.jsonl (checked across
+    -- 2,418 local files), so the log's own mtime is the only clock available.
+    -- Without it every grok session indexes at 0 and sorts as 1970.
+    if (st.started_at or 0) == 0 and (st.mtime or 0) > 0 then
+      st.started_at = st.mtime
+    end
     local parent = (st.dir or ""):match("(.+)/[^/]+$") or ""
     local encoded = parent:match("([^/]+)$")
     if encoded and encoded:find("%%") and (not st.project or st.project == "") then

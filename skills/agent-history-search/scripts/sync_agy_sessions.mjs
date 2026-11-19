@@ -104,14 +104,17 @@ function loadSummaries() {
     let db;
     try {
       db = new DatabaseSync(dbPath, { readOnly: true });
+      // last_user_input_time is protobuf-free SQL text ("2025-12-09 11:31:03.6+00:00"),
+      // so it is the one durable timestamp these conversations record.
       const rows = db.prepare(
-        "SELECT conversation_id, title, workspace_uris FROM conversation_summaries",
+        "SELECT conversation_id, title, workspace_uris, last_user_input_time FROM conversation_summaries",
       ).all();
       for (const row of rows) {
         if (!row.conversation_id) continue;
         map.set(row.conversation_id, {
           title: typeof row.title === "string" ? row.title : "",
           cwd: cwdFrom(row.workspace_uris),
+          createdAt: parseTime(row.last_user_input_time),
         });
       }
     } catch (err) {
@@ -123,12 +126,19 @@ function loadSummaries() {
   return map;
 }
 
+/** SQL datetime text -> epoch ms; 0 when absent or unparseable. */
+function parseTime(value) {
+  if (!value) return 0;
+  const ms = Date.parse(String(value));
+  return Number.isFinite(ms) && ms > 0 ? ms : 0;
+}
+
 export function sessionRecord(id, title, cwd, createdAt) {
   return { type: "session", id, title: title || "", cwd: cwd || "", createdAt: Number(createdAt) || 0 };
 }
 
-export function textEvent(text) {
-  return { type: "text", role: "text", ts: 0, text };
+export function textEvent(text, ts = 0) {
+  return { type: "text", role: "text", ts: Number(ts) || 0, text };
 }
 
 function appendEvents(id, meta, events) {
@@ -136,10 +146,10 @@ function appendEvents(id, meta, events) {
   const filePath = path.join(OUT_DIR, `${id}.jsonl`);
   const lines = [];
   if (!fs.existsSync(filePath)) {
-    lines.push(JSON.stringify(sessionRecord(id, meta.title, meta.cwd, 0)));
+    lines.push(JSON.stringify(sessionRecord(id, meta.title, meta.cwd, meta.createdAt)));
   }
   for (const text of events) {
-    lines.push(JSON.stringify(textEvent(text)));
+    lines.push(JSON.stringify(textEvent(text, meta.createdAt)));
   }
   fs.appendFileSync(filePath, lines.join("\n") + "\n");
   return events.length;

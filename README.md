@@ -65,8 +65,10 @@ bash ~/.agents/skills/agent-history-search/scripts/sync_all_sessions.sh
 recall index
 ```
 
-The extra plugins: `grok`, `kimi`, `droid`, `omp`, `codex-archived`, `agy`,
-`cursor-acp`, `devin`, `dsh`, `mimo`, `opencode`. Six of them need an export
+The extra plugins: `grok`, `kimi`, `droid`, `omp`, `agy`,
+`cursor-acp`, `devin`, `dsh`, `mimo`, `opencode`. Codex's archived tree is a
+second built-in adapter (`codex-archived`) rather than a plugin, because those
+rollouts may be zstd-compressed. Six of them need an export
 step, which `sync_all_sessions.sh` runs (Node ≥ 22, no other dependencies);
 the rest read the tool's own JSONL. `install_plugins.sh` falls back to linking
 `plugins/*.lua` from the checkout when the binary predates a plugin.
@@ -281,11 +283,10 @@ tools recall has no Go adapter for:
 | Plugin | Reads | Storage |
 |---|---|---|
 | `claude` | Claude Code (`claude --resume`) | `~/.claude/projects/<cwd>/*.jsonl` |
-| `codex` | Codex CLI (`codex resume`) | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
+| `codex` | Codex CLI (`codex resume`) | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl[.zst]` |
 | `cursor` | Cursor composer blobs | `state.vscdb` (`composerData:*`, `bubbleId:*`) |
 | `cursor-agent` | Cursor Agent CLI transcripts | `~/.cursor/projects/<slug>/agent-transcripts/<id>/*.jsonl` |
 | `pi` | pi (resumes by id) | `~/.pi/agent/sessions/<cwd>/*.jsonl` |
-| `codex-archived` | Codex sessions moved into the archive | `~/.codex/archived_sessions/rollout-*.jsonl` |
 | `droid` | Factory Droid (`droid resume`) | `~/.factory/sessions/<cwd>/*.jsonl` |
 | `grok` | Grok Build (`grok --resume`) | `~/.grok/sessions/<cwd>/<id>/chat_history.jsonl` |
 | `kimi` | Kimi Code (`kimi -S`) | `~/.kimi-code/sessions/<ws>/session_<id>/agents/*/wire.jsonl` |
