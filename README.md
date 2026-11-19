@@ -254,6 +254,26 @@ Bundled plugins install on demand (nothing auto-runs until you ask); anything in
 plugin is skipped without blocking the others. Kinds: `line` (JSONL), `file`
 (whole document), `kv` (SQLite, incremental via a `watermark`).
 
+The first five mirror the built-in adapters — installing one shadows the Go
+adapter by source id, and `lua_test.go` asserts the two agree. The rest cover
+tools recall has no Go adapter for:
+
+| Plugin | Reads | Storage |
+|---|---|---|
+| `claude` | Claude Code (`claude --resume`) | `~/.claude/projects/<cwd>/*.jsonl` |
+| `codex` | Codex CLI (`codex resume`) | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
+| `cursor` | Cursor composer blobs | `state.vscdb` (`composerData:*`, `bubbleId:*`) |
+| `cursor-agent` | Cursor Agent CLI transcripts | `~/.cursor/projects/<slug>/agent-transcripts/<id>/*.jsonl` |
+| `pi` | pi (resumes by id) | `~/.pi/agent/sessions/<cwd>/*.jsonl` |
+| `codex-archived` | Codex sessions moved into the archive | `~/.codex/archived_sessions/rollout-*.jsonl` |
+| `droid` | Factory Droid (`droid resume`) | `~/.factory/sessions/<cwd>/*.jsonl` |
+| `grok` | Grok Build (`grok --resume`) | `~/.grok/sessions/<cwd>/<id>/chat_history.jsonl` |
+| `kimi` | Kimi Code (`kimi -S`) | `~/.kimi-code/sessions/<ws>/session_<id>/agents/*/wire.jsonl` |
+| `omp` | Oh My Pi (`omp --resume`) | `~/.omp/agent/sessions/<cwd>/*.jsonl` |
+| `memory` | pi persistent memory | `~/.pi/agent/memory/*.md` |
+| `skill` | mirrored skill catalog | `~/.cache/pi-skill-search/catalog` |
+| `obsidian` | an Obsidian vault or notes folder | `~/Documents/Obsidian`, `~/obsidian`, `~/notes` |
+
 See [`plugins/`](plugins/) for examples and
 [`architecture.md`](architecture.md) for the full contract.
 
