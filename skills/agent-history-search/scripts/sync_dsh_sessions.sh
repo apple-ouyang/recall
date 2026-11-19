@@ -102,12 +102,14 @@ fi
 mkdir -p "${out_dir}"
 chmod 700 "${out_dir}"
 
-# size + mtime, portable across BSD (macOS) and GNU stat.
-file_size_mtime() {
-  if stat -f %z "$1" >/dev/null 2>&1; then
-    printf '%s %s\n' "$(stat -f %z "$1")" "$(stat -f %m "$1")"
+# size + mtime for every path in one stat call (BSD then GNU), one line each,
+# in the same order as the arguments. A per-file stat would spawn thousands of
+# processes on a machine with a long DSH history.
+stat_dims() {
+  if stat -f %z /dev/null >/dev/null 2>&1; then
+    stat -f '%z %m' "$@"
   else
-    printf '%s %s\n' "$(stat -c %s "$1")" "$(stat -c %Y "$1")"
+    stat -c '%s %Y' "$@"
   fi
 }
 
@@ -119,13 +121,40 @@ reused=0
 skipped=0
 failed=0
 
-while IFS= read -r src; do
+mapfile -t sources < <(list_dsh_sources "${dsh_home}/sessions" | sort)
+if (( ${#sources[@]} == 0 )); then
+  echo "no DSH session logs found under ${dsh_home}/sessions; nothing to sync"
+  exit 0
+fi
+
+mapfile -t dims < <(stat_dims "${sources[@]}")
+if (( ${#dims[@]} != ${#sources[@]} )); then
+  echo "error: stat returned ${#dims[@]} rows for ${#sources[@]} logs" >&2
+  exit 1
+fi
+
+# The previous run's manifest as a map, so the unchanged check is one lookup
+# instead of a grep over the whole file for every session (that was quadratic
+# and cost ~2 minutes on a 7.9k-session history).
+declare -A previous_dims=()
+if [[ -f "${manifest}" ]]; then
+  while read -r prev_id prev_size prev_mtime; do
+    [[ -n "${prev_id}" ]] || continue
+    previous_dims["${prev_id}"]="${prev_size} ${prev_mtime}"
+  done <"${manifest}"
+fi
+
+for i in "${!sources[@]}"; do
+  src="${sources[$i]}"
   [[ -n "${src}" ]] || continue
-  id="$(basename "$(dirname "${src}")")"
-  read -r size mtime < <(file_size_mtime "${src}")
+  # <sessions>/<cwd>/<id>/session*.zstd — pure-bash dirname/basename so the
+  # loop does not fork twice per session.
+  src_dir="${src%/*}"
+  id="${src_dir##*/}"
+  read -r size mtime <<<"${dims[$i]}"
   target="${out_dir}/${id}.jsonl"
 
-  if [[ -f "${target}" ]] && grep -qxF "${id} ${size} ${mtime}" "${manifest}" 2>/dev/null; then
+  if [[ -f "${target}" && "${previous_dims[${id}]:-}" == "${size} ${mtime}" ]]; then
     printf '%s %s %s\n' "${id}" "${size}" "${mtime}" >>"${next_manifest}"
     skipped=$((skipped + 1))
     continue
@@ -146,7 +175,7 @@ while IFS= read -r src; do
       reused=$((reused + 1))
     fi
   fi
-done < <(list_dsh_sources "${dsh_home}/sessions" | sort)
+done
 
 mv -f "${next_manifest}" "${manifest}"
 echo "dsh sessions: ${decoded} decoded, ${skipped} unchanged, ${failed} failed (${reused} kept previous), tool=${tool}"
