@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // transcriptOpts controls how a session is rendered. Both CLI (recall show)
@@ -104,7 +105,7 @@ func argSummary(raw json.RawMessage) string {
 		}
 		v = strings.TrimSpace(strings.ReplaceAll(v, "\n", " "))
 		if len(v) > toolArgMax {
-			v = v[:toolArgMax] + "\u2026"
+			v = clipUTF8(v, toolArgMax) + "\u2026"
 		}
 		return v
 	}
@@ -320,36 +321,25 @@ func renderOutline(w io.Writer, s *Session, msgs []Message, opts transcriptOpts)
 	// any amount of them is wanted: asking for role=user,assistant on a 1,991
 	// message session returned a 40,000-character "outline", which is the thing
 	// an outline exists to avoid reading.
+	var probe strings.Builder
+	if err := renderOutlineAt(&probe, s, msgs, opts, false); err != nil {
+		return err // includes a malformed range
+	}
+	if probe.Len() <= outlineBudget {
+		_, err := io.WriteString(w, probe.String())
+		return err
+	}
 	if opts.Roles != "" {
-		var probe strings.Builder
-		if err := renderOutlineAt(&probe, s, msgs, opts, false); err != nil {
-			return err
-		}
-		if probe.Len() <= outlineBudget {
-			_, err := io.WriteString(w, probe.String())
-			return err
-		}
 		// Chapter density would contradict the filter, so deliver a prefix and
 		// say plainly where it stops and how to continue from there.
 		return clipOutline(w, probe.String(), len(msgs))
 	}
-	if opts.Roles == "" {
-		var probe strings.Builder
-		if err := renderOutlineAt(&probe, s, msgs, opts, false); err != nil {
-			return err // includes a malformed range
-		}
-		if probe.Len() <= outlineBudget {
-			_, err := io.WriteString(w, probe.String())
-			return err
-		}
-		fmt.Fprintf(w, "// %d msgs: user turns + tool runs only (full outline is %s)."+
-			" Hunting a specific topic? recall_search with session_id costs ~400 chars and"+
-			" gives you the msg_idx directly. Else role='user,assistant' for every turn,"+
-			" range='FROM:TO' to read a span.\n",
-			len(msgs), humanChars(probe.Len()))
-		return renderOutlineAt(w, s, msgs, opts, true)
-	}
-	return renderOutlineAt(w, s, msgs, opts, false)
+	fmt.Fprintf(w, "// %d msgs: user turns + tool runs only (full outline is %s)."+
+		" Hunting a specific topic? recall_search with session_id costs ~400 chars and"+
+		" gives you the msg_idx directly. Else role='user,assistant' for every turn,"+
+		" range='FROM:TO' to read a span.\n",
+		len(msgs), humanChars(probe.Len()))
+	return renderOutlineAt(w, s, msgs, opts, true)
 }
 
 // clipOutline delivers as much of a role-filtered outline as the budget allows
@@ -496,7 +486,7 @@ func renderOutlineAt(w io.Writer, s *Session, msgs []Message, opts transcriptOpt
 			first = "(empty)"
 		}
 		if len(first) > 100 {
-			first = first[:100] + "…"
+			first = clipUTF8(first, 100) + "…"
 		}
 		n, _ := fmt.Fprintf(w, "[%d] %s: %s\n", i, m.Role, first)
 		written += n
@@ -568,22 +558,29 @@ func printHitsWithContext(ctx context.Context, w io.Writer, ix *Index, hits []Hi
 			fmt.Fprintf(w, "## %s  %s  %s\n%s\n",
 				h.StartedTime().Format("2006-01-02 15:04"), h.Source,
 				shortProject(h.Project), h.Title)
-			fmt.Fprintf(w, "id=%s  msg=%d\n\n", h.SessionID, h.MsgIdx)
+			if h.MsgIdx < 0 {
+				fmt.Fprintf(w, "id=%s  (title match)\n\n", h.SessionID)
+			} else {
+				fmt.Fprintf(w, "id=%s  msg=%d\n\n", h.SessionID, h.MsgIdx)
+			}
 		}
 
-		if h.MsgIdx < 0 { // a title-only match has no message to expand
-			fmt.Fprintf(w, "%s\n\n", h.Snippet)
-			continue
+		// A title match points at no message. The title states what the session
+		// is about, and the opening turns say the same thing in full, so expand
+		// those. Printing only the snippet left the best hit with no context.
+		center := max(h.MsgIdx, 0)
+		lo := max(center-n, 0)
+		hi := center + n + 1
+		if h.MsgIdx < 0 {
+			hi = 2*n + 1
 		}
-		lo := h.MsgIdx - n
-		if lo < 0 {
-			lo = 0
-		}
+		// The hit header above already names the session, so the transcript's
+		// own title and source line would only repeat it.
 		if err := printTranscriptTo(ctx, w, ix, h.SessionID, false, transcriptOpts{
-			Range:      fmt.Sprintf("%d:%d", lo, h.MsgIdx+n+1),
+			Range:      fmt.Sprintf("%d:%d", lo, hi),
 			ToolChars:  defaultToolChars,
 			MaxChars:   defaultMaxChars,
-			OmitHeader: shared,
+			OmitHeader: true,
 		}); err != nil {
 			return err
 		}
@@ -609,4 +606,17 @@ func applyBigSessionCap(opts transcriptOpts, msgCount int) (transcriptOpts, stri
 	}
 	opts.Outline = true
 	return opts, fmt.Sprintf("// session has %d messages; defaulting to outline. Call recall_transcript again with range='FROM:TO' (e.g. range='-50:'), or role='user,assistant' to skip tool noise.\n\n", msgCount)
+}
+
+// clipUTF8 cuts s to at most n bytes without splitting a multi-byte
+// character. A plain s[:n] can end mid-rune, which leaves a broken character in
+// a stored title or printed outline for anything that is not ASCII.
+func clipUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

@@ -89,8 +89,11 @@ func (a *CodexAdapter) ScanStream(ctx context.Context, prev string, emit EmitFun
 		// reparsed in full; the size+mtime check above still skips them when
 		// they have not changed.
 		if !compressed && ok && prevSt.SID != "" && size > prevSt.Size && prevSt.Offset <= size {
-			if p, e := a.parse(ctx, path, prevSt.Offset, prevSt.Idx, prevSt.SID, true); e == nil && len(p.msgs) > 0 {
+			if p, e := a.parse(ctx, path, prevSt.Offset, prevSt.Idx, prevSt.SID, true); e == nil {
 				nextMap[path] = fileState{Size: size, MTime: mtime, Offset: p.endOffset, Idx: p.nextIdx, SID: prevSt.SID}
+				if len(p.msgs) == 0 {
+					return nil // grew by non-message lines; nothing new to index
+				}
 				s := p.session(prevSt.SID)
 				s.Source = a.source()
 				s.Append = true
@@ -100,14 +103,16 @@ func (a *CodexAdapter) ScanStream(ctx context.Context, prev string, emit EmitFun
 		}
 
 		p, e := a.parse(ctx, path, 0, 0, "", true)
-		endOffset := p.endOffset
-		if compressed {
-			endOffset = 0
-		}
-		nextMap[path] = fileState{Size: size, MTime: mtime, Offset: endOffset, Idx: p.nextIdx, SID: p.sessID}
 		if e != nil || p.sessID == "" || len(p.msgs) == 0 {
+			// Nothing indexed: no SID, so growth re-reads in full (see pi.go).
+			nextMap[path] = fileState{Size: size, MTime: mtime}
 			return nil
 		}
+		endOffset := p.endOffset
+		if compressed {
+			endOffset = 0 // see above: a stream offset is not a file offset
+		}
+		nextMap[path] = fileState{Size: size, MTime: mtime, Offset: endOffset, Idx: p.nextIdx, SID: p.sessID}
 		sess := p.session(p.sessID)
 		sess.Source = a.source()
 		return be.add(sess, p.msgs)
@@ -360,13 +365,13 @@ func (p CodexPayload) flatten(callNames map[string]string) (role, text string) {
 		}
 		args := p.Arguments
 		if len(args) > 400 {
-			args = args[:400]
+			args = clipUTF8(args, 400)
 		}
 		return "tool:" + p.Name, args
 	case "function_call_output":
 		s := p.Output.Content
 		if len(s) > 400 {
-			s = s[:400]
+			s = clipUTF8(s, 400)
 		}
 		// The "[output] " prefix said what the role already says; naming the tool
 		// in the role is both shorter and more informative.

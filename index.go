@@ -44,6 +44,10 @@ func indexDSN(path string, readOnly bool) string {
 		pragmas = append(pragmas, "query_only(1)")
 	} else {
 		params = append(params, "_txlock=immediate")
+		// auto_vacuum must precede journal_mode: switching to WAL writes the
+		// file header, after which auto_vacuum changes only through a VACUUM.
+		// On an existing index this is a no-op until Compact converts it.
+		pragmas = append([]string{"auto_vacuum(INCREMENTAL)"}, pragmas...)
 		pragmas = append(pragmas, "journal_mode(WAL)")
 	}
 	for _, p := range pragmas {
@@ -110,6 +114,12 @@ const schemaVersion = "6"
 var tailWeightSQL = strconv.FormatFloat(tailWeight, 'f', -1, 64)
 
 func bootstrap(db *sql.DB) error {
+	// auto_vacuum=INCREMENTAL is set in the DSN (see indexDSN). It lets
+	// Compact return freed pages to the disk without a full VACUUM.
+	hadSchema, err := tableExists(db, "sessions")
+	if err != nil {
+		return err
+	}
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS sessions (
 			id          TEXT PRIMARY KEY,
@@ -192,6 +202,16 @@ func bootstrap(db *sql.DB) error {
 	for _, s := range ftsStmts {
 		if _, err := db.Exec(s); err != nil {
 			return fmt.Errorf("%s: %w", firstLine(s), err)
+		}
+	}
+	if !hadSchema {
+		// A new index has no stale rows and no other writer yet. An existing
+		// index without these keys has an unknown history, so it is checked
+		// once (see ReconcileForeignWrites and NeedsCompaction).
+		for _, k := range []string{metaStaleRows, metaSeenMaxRowid, metaChurnBase} {
+			if _, err := db.Exec(`INSERT OR IGNORE INTO meta(k,v) VALUES(?, '0')`, k); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -372,6 +392,118 @@ func firstLine(s string) string {
 	return s
 }
 
+// ftsDropper removes a session's message rows from messages_fts.
+//
+// messages_fts.session_pk is UNINDEXED, so "DELETE ... WHERE session_pk = ?"
+// cannot seek — it scans the whole FTS table. Each session's rows go in as
+// contiguous rowid runs recorded in msg_ranges, so the delete seeks on the FTS
+// primary key instead. A session indexed before v5 has no range; it falls back
+// to the scan once and gets a range recorded on reinsert.
+//
+// Ingest and ForgetSession share this so neither can leave a msg_ranges row
+// behind: a stale range outlives its session, and once FTS reuses those rowids
+// for another session, the next re-ingest of the first deletes the second's rows.
+type ftsDropper struct {
+	selRanges, delRange, delRangeRows, delFTS *sql.Stmt
+	// deleted counts the FTS rows removed. FTS5 does not remove a deleted
+	// row's postings; it writes a delete marker and keeps both until a merge
+	// reaches them. The count is the stale data that Compact recovers.
+	deleted int64
+}
+
+// addStale records n deleted FTS rows in the stale-row counter. It is an
+// UPDATE, so an index whose counter is missing (history unknown) keeps it
+// missing until Compact sets it.
+func addStale(ctx context.Context, tx *sql.Tx, n int64) error {
+	if n == 0 {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx,
+		`UPDATE meta SET v = CAST(v AS INTEGER) + ? WHERE k = ?`, n, metaStaleRows)
+	return err
+}
+
+func prepareFTSDropper(ctx context.Context, tx *sql.Tx) (*ftsDropper, error) {
+	d := &ftsDropper{}
+	for _, p := range []struct {
+		dst **sql.Stmt
+		q   string
+	}{
+		{&d.selRanges, `SELECT lo, hi FROM msg_ranges WHERE session_pk = ?`},
+		{&d.delRange, `DELETE FROM messages_fts WHERE rowid BETWEEN ? AND ?`},
+		{&d.delRangeRows, `DELETE FROM msg_ranges WHERE session_pk = ?`},
+		{&d.delFTS, `DELETE FROM messages_fts WHERE session_pk = ?`},
+	} {
+		st, err := tx.PrepareContext(ctx, p.q)
+		if err != nil {
+			d.Close()
+			return nil, err
+		}
+		*p.dst = st
+	}
+	return d, nil
+}
+
+func (d *ftsDropper) Close() {
+	for _, st := range []*sql.Stmt{d.selRanges, d.delRange, d.delRangeRows, d.delFTS} {
+		if st != nil {
+			st.Close()
+		}
+	}
+}
+
+// drop deletes pk's FTS rows and its recorded ranges.
+func (d *ftsDropper) drop(pk string) error {
+	rows, err := d.selRanges.Query(pk)
+	if err != nil {
+		return err
+	}
+	type span struct{ lo, hi int64 }
+	var spans []span
+	for rows.Next() {
+		var sp span
+		if err := rows.Scan(&sp.lo, &sp.hi); err != nil {
+			rows.Close()
+			return err
+		}
+		spans = append(spans, sp)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(spans) == 0 {
+		res, err := d.delFTS.Exec(pk) // pre-v5 session: no range to seek with
+		if err != nil {
+			return err
+		}
+		d.count(res)
+		return nil
+	}
+	for _, sp := range spans {
+		res, err := d.delRange.Exec(sp.lo, sp.hi)
+		if err != nil {
+			return err
+		}
+		d.count(res)
+	}
+	return d.forgetRanges(pk)
+}
+
+func (d *ftsDropper) count(res sql.Result) {
+	if n, err := res.RowsAffected(); err == nil {
+		d.deleted += n
+	}
+}
+
+// forgetRanges drops pk's msg_ranges rows without touching FTS. Used when the
+// session row is absent: any range still on record is stale and its rowids may
+// already belong to another session.
+func (d *ftsDropper) forgetRanges(pk string) error {
+	_, err := d.delRangeRows.Exec(pk)
+	return err
+}
+
 func (ix *Index) IngestBatch(ctx context.Context, source string, sessions []Session, msgs []Message) error {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -411,33 +543,16 @@ func (ix *Index) IngestBatch(ctx context.Context, source string, sessions []Sess
 	}
 	defer sessionExists.Close()
 
-	selRanges, err := tx.Prepare(`SELECT lo, hi FROM msg_ranges WHERE session_pk = ?`)
+	dropper, err := prepareFTSDropper(ctx, tx)
 	if err != nil {
 		return err
 	}
-	defer selRanges.Close()
-	delRange, err := tx.Prepare(`DELETE FROM messages_fts WHERE rowid BETWEEN ? AND ?`)
-	if err != nil {
-		return err
-	}
-	defer delRange.Close()
-	delRangeRows, err := tx.Prepare(`DELETE FROM msg_ranges WHERE session_pk = ?`)
-	if err != nil {
-		return err
-	}
-	defer delRangeRows.Close()
+	defer dropper.Close()
 	insRange, err := tx.Prepare(`INSERT INTO msg_ranges(session_pk, lo, hi) VALUES(?,?,?)`)
 	if err != nil {
 		return err
 	}
 	defer insRange.Close()
-
-	// Fallback for sessions indexed before v5, which have no recorded range.
-	delFTS, err := tx.Prepare(`DELETE FROM messages_fts WHERE session_pk = ?`)
-	if err != nil {
-		return err
-	}
-	defer delFTS.Close()
 
 	insFTS, err := tx.Prepare(`INSERT INTO messages_fts(session_pk, idx, role, text, tail) VALUES(?,?,?,?,?)`)
 	if err != nil {
@@ -472,41 +587,6 @@ func (ix *Index) IngestBatch(ctx context.Context, source string, sessions []Sess
 		return err
 	}
 	defer updAgg.Close()
-
-	// dropSessionRows removes a session's FTS rows. It seeks via the recorded
-	// rowid ranges; a session indexed before v5 has none, so it falls back to the
-	// scanning delete once and gets a range recorded on reinsert.
-	dropSessionRows := func(pk string) error {
-		rows, err := selRanges.Query(pk)
-		if err != nil {
-			return err
-		}
-		type span struct{ lo, hi int64 }
-		var spans []span
-		for rows.Next() {
-			var sp span
-			if err := rows.Scan(&sp.lo, &sp.hi); err != nil {
-				rows.Close()
-				return err
-			}
-			spans = append(spans, sp)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
-		}
-		if len(spans) == 0 {
-			_, err := delFTS.Exec(pk) // pre-v5 session: no range to seek with
-			return err
-		}
-		for _, sp := range spans {
-			if _, err := delRange.Exec(sp.lo, sp.hi); err != nil {
-				return err
-			}
-		}
-		_, err = delRangeRows.Exec(pk)
-		return err
-	}
 
 	// Group by session, and keep one message per (session, idx). An adapter can
 	// legitimately emit the same session id twice in a batch — cursor-agent
@@ -601,12 +681,16 @@ func (ix *Index) IngestBatch(ctx context.Context, source string, sessions []Sess
 			return fmt.Errorf("upsert session %s: %w", pk, err)
 		}
 		if hadRows {
-			if err := dropSessionRows(pk); err != nil {
+			if err := dropper.drop(pk); err != nil {
 				return err
 			}
 			if _, err := delSessFTS.Exec(pk); err != nil {
 				return err
 			}
+		} else if err := dropper.forgetRanges(pk); err != nil {
+			// An index written before ForgetSession cleaned up after itself can
+			// still hold ranges for a session that has since come back.
+			return err
 		}
 		if _, err := insSessFTS.Exec(pk, s.Title, s.Project); err != nil {
 			return fmt.Errorf("insert session_fts %s: %w", pk, err)
@@ -647,6 +731,9 @@ func (ix *Index) IngestBatch(ctx context.Context, source string, sessions []Sess
 			}
 		}
 	}
+	if err := addStale(ctx, tx, dropper.deleted); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 
@@ -676,8 +763,8 @@ func withEstimate(s Session) Session {
 // tool-call marker: "[tool:bash] git log --oneline" -> "[tool:bash]".
 var toolArgSuffix = regexp.MustCompile(`(?m)^(\[(?:tool|tool_use):[^\]]+\]|\[call [^\]]+\]) .*$`)
 
-// trimText prepares a message for the search index. Transcripts render from the
-// adapter's Fetch, so this affects search only.
+// splitForIndex prepares a message for the search index. Transcripts render
+// from the adapter's Fetch, so this affects search only.
 //
 // The tool-call argument is dropped here while staying visible in a rendered
 // transcript. Indexing it is actively harmful: measured against the sessions
@@ -686,8 +773,9 @@ var toolArgSuffix = regexp.MustCompile(`(?m)^(\[(?:tool|tool_use):[^\]]+\]|\[cal
 // an unrelated query to win the AND pass and crowd out the right session.
 // Only the argument is stripped, never the marker itself — 13% of messages are
 // nothing but a marker, and removing those entirely drops them from the index.
-// splitForIndex divides a message into the opening that is indexed normally and
-// the windows of everything after it.
+//
+// It divides a message into the opening that is indexed normally and the
+// windows of everything after it.
 //
 // Truncating at excerptMax left 44% of all human and model prose unsearchable:
 // only ~5% of parts are long enough to cut, but they carry nearly half the
@@ -763,15 +851,6 @@ func boundary(s string, start, end int) int {
 	return cut
 }
 
-func trimText(s string) string {
-	s = toolArgSuffix.ReplaceAllString(s, "$1")
-	s = strings.TrimSpace(s)
-	if len(s) > excerptMax {
-		s = s[:excerptMax]
-	}
-	return s
-}
-
 // BulkMode wraps a batch ingest with write-tuning pragmas. `full` distinguishes
 // a from-scratch rebuild from a cheap incremental refresh:
 //   - full: disable FTS automerge during insert, then run a one-shot `optimize`
@@ -789,17 +868,188 @@ func (ix *Index) BulkMode(on, full bool) {
 		return
 	}
 
-	if full {
-		_, _ = ix.db.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('optimize')`)
-		_, _ = ix.db.Exec(`INSERT INTO sessions_fts(sessions_fts) VALUES('optimize')`)
-	}
+	// automerge is stored in the FTS table, not the connection. A full run that
+	// turned it off and never turned it back on left every later run with no
+	// background merging, so delete markers and their rows were never removed.
+	// Restore it on every exit path, including an interrupted run.
+	_, _ = ix.db.Exec(`INSERT INTO messages_fts(messages_fts, rank) VALUES('automerge', ?)`, ftsAutomerge)
+	_, _ = ix.db.Exec(`INSERT INTO sessions_fts(sessions_fts, rank) VALUES('automerge', ?)`, ftsAutomerge)
 	_, _ = ix.db.Exec(`PRAGMA synchronous=NORMAL`)
 	_, _ = ix.db.Exec(`PRAGMA cache_size=-65536`)
-	if full {
-		_, _ = ix.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
-	} else {
-		_, _ = ix.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+	_, _ = ix.db.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
+}
+
+// ftsAutomerge is the FTS5 default: merge once a level holds 4 segments.
+const ftsAutomerge = 4
+
+// metaStaleRows counts FTS rows deleted since the last Compact.
+const metaStaleRows = "fts_stale_rows"
+
+// metaSeenMaxRowid is the highest messages_fts rowid at the end of the last
+// run of this build. metaChurnBase is ftsChurn at the last Compact.
+const (
+	metaSeenMaxRowid = "fts_seen_max_rowid"
+	metaChurnBase    = "fts_churn_base"
+)
+
+// ftsMaxRowid returns the highest messages_fts rowid. FTS5 gives each new row
+// a rowid above the current highest, so any insert, by any writer, raises it.
+// It is a seek on the docsize primary key: about 10 µs.
+func (ix *Index) ftsMaxRowid() (int64, error) {
+	var n int64
+	err := ix.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM messages_fts_docsize`).Scan(&n)
+	return n, err
+}
+
+// ftsChurn returns how many rowids were used and then deleted. Rowids start
+// at 1 and each new row goes above the highest, so every rowid up to the
+// highest was used once: the ones that are not live were deleted. (Deleting
+// the highest rows lets their rowids be used again; those deletes are missed.)
+// It counts all live rows: about 60 ms on 1.2 million rows, so it runs only
+// when needed.
+func (ix *Index) ftsChurn() (int64, error) {
+	var n int64
+	err := ix.db.QueryRow(`SELECT COALESCE(MAX(id), 0) - COUNT(*) FROM messages_fts_docsize`).Scan(&n)
+	return n, err
+}
+
+// ReconcileForeignWrites adds deletes made by other writers to the stale-row
+// debt, and reports whether there were any.
+//
+// Only this build counts its deletes. An older recall, or another tool, that
+// writes the same index deletes rows that the counter never sees: a real
+// index grew from 1.5 GB to 3.2 GB in three weeks under an older binary, with
+// 10.8 million uncounted deletes, and nothing compacted it. Call this before
+// the run's own writes. If the highest rowid moved since this build's last
+// run, another writer was here; then the deletes since the last Compact give
+// the true debt.
+func (ix *Index) ReconcileForeignWrites() (bool, error) {
+	cur, err := ix.ftsMaxRowid()
+	if err != nil {
+		return false, err
 	}
+	if seen := ix.GetMeta(metaSeenMaxRowid); seen != "" && seen == strconv.FormatInt(cur, 10) {
+		return false, nil
+	}
+	churn, err := ix.ftsChurn()
+	if err != nil {
+		return false, err
+	}
+	base, _ := strconv.ParseInt(ix.GetMeta(metaChurnBase), 10, 64)
+	debt := churn - base
+	if counted, err := strconv.ParseInt(ix.GetMeta(metaStaleRows), 10, 64); err == nil && counted >= debt {
+		return true, nil
+	}
+	return true, ix.SetMeta(metaStaleRows, strconv.FormatInt(debt, 10))
+}
+
+// RecordSeen stores the highest rowid at the end of a run, so the next run
+// can tell whether another writer was here.
+func (ix *Index) RecordSeen() error {
+	cur, err := ix.ftsMaxRowid()
+	if err != nil {
+		return err
+	}
+	return ix.SetMeta(metaSeenMaxRowid, strconv.FormatInt(cur, 10))
+}
+
+// Compact when stale rows exceed 1/compactStaleDivisor of live rows. Below
+// that, a merge costs more than the space it recovers.
+const compactStaleDivisor = 10
+
+// NeedsCompaction reports whether the FTS index holds enough stale data to
+// merge it now, and why.
+//
+// The stale data comes from deletes. A full rebuild deletes every row and
+// inserts it again, so it doubles the index until a merge runs. That merge was
+// one 'optimize' at the end of the run, with its error ignored. A run that was
+// interrupted, or that lost the write lock to a concurrent run, skipped it and
+// nothing ran it later: a real index was 3.2 GB of FTS data where 0.36 GB was
+// live. The counter keeps the debt until a Compact pays it.
+func (ix *Index) NeedsCompaction() (bool, string) {
+	v := ix.GetMeta(metaStaleRows)
+	if v == "" {
+		return true, "first run since upgrade"
+	}
+	stale, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return true, "stale-row counter unreadable"
+	}
+	var live int64
+	if err := ix.db.QueryRow(`SELECT COUNT(*) FROM messages_fts_docsize`).Scan(&live); err != nil {
+		return false, ""
+	}
+	if stale > 0 && stale*compactStaleDivisor >= live {
+		return true, fmt.Sprintf("%d stale rows, %d live", stale, live)
+	}
+	return false, ""
+}
+
+// Compact merges each FTS index into one segment, which drops deleted rows and
+// their delete markers, and then returns the freed pages to the disk.
+// It holds the write lock for its duration; searches continue under WAL.
+func (ix *Index) Compact() error {
+	for _, t := range []string{"messages_fts", "sessions_fts"} {
+		if _, err := ix.db.Exec(`INSERT INTO ` + t + `(` + t + `) VALUES('optimize')`); err != nil {
+			return fmt.Errorf("optimize %s: %w", t, err)
+		}
+	}
+	if err := ix.SetMeta(metaStaleRows, "0"); err != nil {
+		return err
+	}
+	// Optimize removes deleted rows but does not renumber the live ones.
+	// Record the delete count now, so a later debt counts only new deletes.
+	churn, err := ix.ftsChurn()
+	if err != nil {
+		return err
+	}
+	if err := ix.SetMeta(metaChurnBase, strconv.FormatInt(churn, 10)); err != nil {
+		return err
+	}
+	if err := ix.reclaim(); err != nil {
+		return fmt.Errorf("reclaim free pages: %w", err)
+	}
+	_, err = ix.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
+// reclaim gives free pages back to the file system. SQLite reuses free pages
+// for later writes, so a small free list is left in place.
+func (ix *Index) reclaim() error {
+	var pages, free, mode int64
+	for _, p := range []struct {
+		q   string
+		dst *int64
+	}{
+		{`PRAGMA page_count`, &pages},
+		{`PRAGMA freelist_count`, &free},
+		{`PRAGMA auto_vacuum`, &mode},
+	} {
+		if err := ix.db.QueryRow(p.q).Scan(p.dst); err != nil {
+			return err
+		}
+	}
+	if free*4 < pages {
+		return nil
+	}
+	if mode == 2 { // INCREMENTAL
+		_, err := ix.db.Exec(`PRAGMA incremental_vacuum`)
+		return err
+	}
+	// An index created before auto_vacuum was set. The mode only changes
+	// through a VACUUM, so convert it once; later compactions are incremental.
+	// VACUUM builds a complete copy, so put it in a file, not in memory.
+	for _, q := range []string{
+		`PRAGMA auto_vacuum=INCREMENTAL`,
+		`PRAGMA temp_store=FILE`,
+		`VACUUM`,
+		`PRAGMA temp_store=MEMORY`,
+	} {
+		if _, err := ix.db.Exec(q); err != nil {
+			return fmt.Errorf("%s: %w", q, err)
+		}
+	}
+	return nil
 }
 
 func (ix *Index) SetMeta(k, v string) error {
@@ -905,12 +1155,8 @@ func (ix *Index) searchMatch(ftsQuery string, opts SearchOpts) ([]Hit, error) {
 	args = append(args, limit)
 
 	bodyWhere := append([]string{}, where...)
-	titleWhere := []string{"sessions_fts MATCH ?"}
-	titleArgs := []any{ftsQuery}
-	for _, w := range where[1:] {
-		titleWhere = append(titleWhere, w)
-	}
-	titleArgs = append(titleArgs, args[1:len(args)-1]...)
+	titleWhere := append([]string{"sessions_fts MATCH ?"}, where[1:]...)
+	titleArgs := append([]any{ftsQuery}, args[1:len(args)-1]...)
 
 	// A title match says "this session is relevant". Scoped to one session that
 	// is already known, so the row is pure noise: it occupies a hit slot and, with
@@ -1326,32 +1572,20 @@ func (ix *Index) Related(id string, limit int) ([]Hit, error) {
 		limit = 10
 	}
 
-	rows, err := ix.db.Query(`
-		SELECT COALESCE(s.title,''),
-		       f.text
-		  FROM sessions s LEFT JOIN messages_fts f ON f.session_pk = s.id
-		 WHERE s.id = ?
-		 ORDER BY f.idx ASC LIMIT 6`, id)
+	var title string
+	err := ix.db.QueryRow(`SELECT COALESCE(title,'') FROM sessions WHERE id = ?`, id).Scan(&title)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ix.missingSessionError(id)
+	}
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var title string
-	var snippets []string
-	for rows.Next() {
-		var t, txt string
-		if err := rows.Scan(&t, &txt); err != nil {
-			return nil, err
-		}
-		if title == "" {
-			title = t
-		}
-		if txt != "" {
-			snippets = append(snippets, txt)
-		}
+	snippets, err := ix.openingTexts(id, 6)
+	if err != nil {
+		return nil, err
 	}
 	if title == "" && len(snippets) == 0 {
-		return nil, fmt.Errorf("session %s not found or empty", id)
+		return nil, fmt.Errorf("session %s is empty", id)
 	}
 	query := topTerms(title+" "+strings.Join(snippets, " "), 6)
 	hits, err := ix.Search(query, SearchOpts{Limit: limit + 1})
@@ -1359,17 +1593,67 @@ func (ix *Index) Related(id string, limit int) ([]Hit, error) {
 		return nil, err
 	}
 
-	out := make([]Hit, 0, len(hits))
-	for _, h := range hits {
-		if h.SessionID == id {
-			continue
-		}
-		out = append(out, h)
-		if len(out) >= limit {
-			break
+	out := make([]Hit, 0, limit)
+	seen := map[string]bool{id: true}
+	add := func(hs []Hit) {
+		for _, h := range hs {
+			if len(out) >= limit {
+				return
+			}
+			if !seen[h.SessionID] {
+				seen[h.SessionID] = true
+				out = append(out, h)
+			}
 		}
 	}
+	add(hits)
+	// The source session always matches every one of its own top terms, so
+	// Search's any-term fallback (which runs only on zero AND hits) never fires
+	// here, and a session whose six terms co-occur nowhere else got nothing.
+	// Keep the all-terms hits first, then fill the remaining slots from any term.
+	if terms := ftsTerms(query); len(out) < limit && len(terms) > 1 {
+		more, err := ix.searchMatch(strings.Join(terms, " OR "),
+			SearchOpts{Limit: limit + len(seen)})
+		if err != nil {
+			return nil, err
+		}
+		add(more)
+	}
 	return out, nil
+}
+
+// openingTexts returns the head text of a session's first n messages.
+//
+// It reads through msg_ranges, because joining messages_fts on its UNINDEXED
+// session_pk scans every row in the table — 9s on a 1.1M-row index, for six
+// rows. Rows of one session go in in idx order, so rowid order is message order.
+func (ix *Index) openingTexts(pk string, n int) ([]string, error) {
+	q := `SELECT f.text FROM msg_ranges r
+	        JOIN messages_fts f ON f.rowid BETWEEN r.lo AND r.hi
+	       WHERE r.session_pk = ? AND f.session_pk = r.session_pk AND f.text != ''
+	       ORDER BY f.rowid LIMIT ?`
+	var hasRange int
+	if err := ix.db.QueryRow(`SELECT COUNT(*) FROM msg_ranges WHERE session_pk = ?`, pk).Scan(&hasRange); err != nil {
+		return nil, err
+	}
+	if hasRange == 0 { // pre-v5 session: no range recorded, scan instead
+		q = `SELECT text FROM messages_fts WHERE session_pk = ? AND text != ''
+		      ORDER BY rowid LIMIT ?`
+	}
+	rows, err := ix.db.Query(q, pk, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
 
 func topTerms(text string, n int) string {
@@ -1499,7 +1783,7 @@ type TagCount struct {
 func (ix *Index) sessionExists(id string) (bool, error) {
 	var n int
 	if err := ix.db.QueryRow(`SELECT 1 FROM sessions WHERE id = ? LIMIT 1`, id).Scan(&n); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		return false, err
@@ -1626,51 +1910,23 @@ func normalizeTag(s string) string {
 // hits that error when an agent opens them. Tags are deliberately left alone:
 // they are durable user data keyed on the id, and the session may come back.
 func (ix *Index) ForgetSession(id string) error {
-	tx, err := ix.db.Begin()
+	ctx := context.Background()
+	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
-	// messages_fts.session_pk is UNINDEXED, so "WHERE session_pk = ?" scans the
-	// whole FTS table. PruneMissing calls this once per vanished session, which
-	// makes a naive delete quadratic: 944 stale agy rows held the prune at
-	// "claude indexing…" for 15+ minutes. Delete by rowid instead, using the
-	// contiguous ranges IngestBatch recorded. Sessions indexed before v5 have no
-	// range; those keep the slow path and heal on their next reindex.
-	rows, err := tx.Query(`SELECT lo, hi FROM msg_ranges WHERE session_pk = ?`, id)
+	dropper, err := prepareFTSDropper(ctx, tx)
 	if err != nil {
 		return err
 	}
-	var spans [][2]int64
-	for rows.Next() {
-		var lo, hi int64
-		if err := rows.Scan(&lo, &hi); err != nil {
-			rows.Close()
-			return err
-		}
-		spans = append(spans, [2]int64{lo, hi})
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	defer dropper.Close()
+	if err := dropper.drop(id); err != nil {
 		return err
 	}
-
-	if len(spans) == 0 {
-		if _, err := tx.Exec(`DELETE FROM messages_fts WHERE session_pk = ?`, id); err != nil {
-			return err
-		}
-	} else {
-		for _, sp := range spans {
-			if _, err := tx.Exec(`DELETE FROM messages_fts WHERE rowid BETWEEN ? AND ?`, sp[0], sp[1]); err != nil {
-				return err
-			}
-		}
-		if _, err := tx.Exec(`DELETE FROM msg_ranges WHERE session_pk = ?`, id); err != nil {
-			return err
-		}
+	if err := addStale(ctx, tx, dropper.deleted); err != nil {
+		return err
 	}
-
 	for _, q := range []string{
 		`DELETE FROM sessions_fts WHERE session_pk = ?`,
 		`DELETE FROM sessions WHERE id = ?`,

@@ -251,7 +251,7 @@ type commonFlags struct {
 
 func (cf *commonFlags) register(fs *flag.FlagSet) {
 	fs.StringVar(&cf.repo, "repo", "", "restrict to a project folder")
-	fs.StringVar(&cf.in, "in", "", "restrict to one session id (search inside a transcript);\n\t\".\" = the newest session for this repo")
+	fs.StringVar(&cf.in, "in", "", "restrict to one session id (search inside a transcript);\n\t\".\" = the current pi session (PI_SESSION_ID)")
 	fs.StringVar(&cf.since, "since", "", "alias for --after (lower time bound)")
 	fs.StringVar(&cf.after, "after", "", "only sessions started after this: 7d, an epoch-ms, or YYYY-MM-DD")
 	fs.StringVar(&cf.before, "before", "", "only sessions started before this (for paging back through history)")
@@ -581,12 +581,32 @@ func runIndex(args []string) error {
 		os.Exit(130)
 	}()
 
-	ix, err := openIndex(defaultIndexPath())
+	idxPath := defaultIndexPath()
+	if err := os.MkdirAll(filepath.Dir(idxPath), 0o755); err != nil {
+		return err
+	}
+	// Checkpoints are read below, outside any write transaction, so two
+	// overlapping runs would both append the same messages. Serialise them.
+	unlock, err := lockIndexWriter(ctx, idxPath)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil // interrupted while waiting; nothing was touched
+		}
+		return err
+	}
+	defer unlock()
+
+	ix, err := openIndex(idxPath)
 	if err != nil {
 		return err
 	}
 	defer ix.Close()
 
+	// Another writer (an older recall, for example) may have deleted rows
+	// that the stale-row counter never saw. Add them before this run writes.
+	if _, err := ix.ReconcileForeignWrites(); err != nil {
+		fmt.Fprintf(os.Stderr, "  stale-row check failed: %v\n", err)
+	}
 	ix.BulkMode(true, *full)
 
 	start := time.Now()
@@ -676,13 +696,26 @@ func runIndex(args []string) error {
 		return nil
 	}
 
-	if *full {
-		fmt.Printf("  optimizing FTS index…")
-		os.Stdout.Sync()
-	}
 	ix.BulkMode(false, *full)
+	// A full run deletes and re-inserts every row, so it always compacts.
+	// Otherwise compact only when the stale-row debt is large enough.
+	need, why := ix.NeedsCompaction()
 	if *full {
-		fmt.Printf("\r\033[K")
+		need, why = true, "full rebuild"
+	}
+	if need {
+		fmt.Printf("  compacting index (%s)…", why)
+		os.Stdout.Sync()
+		t0 := time.Now()
+		if err := ix.Compact(); err != nil {
+			// The counter is unchanged, so the next run tries again.
+			fmt.Printf("\r\033[K  compact failed: %v\n", err)
+		} else {
+			fmt.Printf("\r\033[K  compacted index in %s\n", time.Since(t0).Round(time.Millisecond))
+		}
+	}
+	if err := ix.RecordSeen(); err != nil {
+		fmt.Fprintf(os.Stderr, "  record index state: %v\n", err)
 	}
 	_ = ix.SetMeta("indexed_at", time.Now().Format(time.RFC3339))
 	fmt.Printf("indexed %d sessions in %s → %s\n",
@@ -843,12 +876,67 @@ func runFind(args []string) error {
 	if cf.json {
 		return JSONNewEncoder(os.Stdout).Encode(hits)
 	}
+	if len(hits) == 0 {
+		// --context with no hits used to print nothing at all.
+		fmt.Println("no matches")
+		printOutsideFilter(os.Stdout, ix, query, opts, cf)
+		return nil
+	}
 	if *context_ > 0 {
 		return printHitsWithContext(context.Background(), os.Stdout, ix, hits, *context_)
 	}
 	printHits(os.Stdout, hits)
 	printPager(os.Stdout, "find", query, cf, hits)
 	return nil
+}
+
+// outsideFilterLimit caps the search that printOutsideFilter runs.
+const outsideFilterLimit = 30
+
+// printOutsideFilter explains an empty result that a filter caused.
+//
+// An agent turns "last month" into --since 30d, or adds --repo . from a
+// directory the session was not run in. A bare "no matches" then reads as
+// "we never did that", and the agent tells the user so. Say what the filter
+// removed and give the command without it. --in and --tag stay: they name
+// the exact thing that the caller wants.
+func printOutsideFilter(w io.Writer, ix *Index, query string, opts SearchOpts, cf commonFlags) {
+	if strings.TrimSpace(query) == "" {
+		return
+	}
+	wide, wideCF := opts, cf
+	var removed []string
+	if opts.After != 0 || opts.Before != 0 {
+		wide.After, wide.Before = 0, 0
+		wideCF.after, wideCF.before, wideCF.since = "", "", ""
+		removed = append(removed, "time range")
+	}
+	if opts.Project != "" {
+		wide.Project, wideCF.repo = "", ""
+		removed = append(removed, "project "+shortProject(opts.Project))
+	}
+	if len(removed) == 0 {
+		return
+	}
+	wide.Limit = outsideFilterLimit
+	hits, err := ix.Search(query, wide)
+	if err != nil || len(hits) == 0 {
+		return
+	}
+	newest := hits[0]
+	for _, h := range hits {
+		if h.StartedAt > newest.StartedAt {
+			newest = h
+		}
+	}
+	count := strconv.Itoa(len(hits))
+	if len(hits) >= outsideFilterLimit {
+		count += "+"
+	}
+	fmt.Fprintf(w, "// %s hits are outside the %s. The newest is from %s in %s."+
+		" To search them: %s\n",
+		count, strings.Join(removed, " and "), newest.StartedTime().Format("2006-01-02"),
+		shortProject(newest.Project), pagerBase("find", query, wideCF))
 }
 
 // printPager emits one-line, copy-pasteable next/prev page commands so an agent
